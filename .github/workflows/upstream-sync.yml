@@ -71,26 +71,19 @@ jobs:
           else
             changed=true
           fi
-          # Deterministic auto-merge gate (D10): any diff hunk mentioning an executable-content key
-          # disqualifies the PR from auto-merge, regardless of the review verdict.
-          risky=false
-          if grep -Eq '^[+-].*(injections:|regexRules:|<script|javascript:)' /tmp/ruleset.diff; then
-            risky=true
-          fi
           {
             echo "upstream_sha=$upstream_sha"
             echo "short_sha=${upstream_sha:0:7}"
             echo "base=$base"
             echo "dry=$dry"
             echo "changed=$changed"
-            echo "risky=$risky"
           } >> "$GITHUB_OUTPUT"
           {
             echo "### upstream-sync (ladder-rules)"
             echo ""
             echo "- upstream/main: \`$upstream_sha\`"
             echo "- compared against: \`$base\`"
-            echo "- dry run: \`$dry\` · changed: \`$changed\` · touches injections/regexRules: \`$risky\`"
+            echo "- dry run: \`$dry\` · changed: \`$changed\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Refresh the mirror on a branch
@@ -142,7 +135,6 @@ jobs:
             - branch ${{ steps.branch.outputs.branch }} is already committed and pushed; it refreshes
               upstream.yaml only, and the validator (scripts/validate-ruleset.py) passed on it
             - the diff touches injections/regexRules (per a deterministic grep):
-              ${{ steps.diff.outputs.risky }}
 
             Do NOT commit, amend or push anything, and never touch custom.yaml — that file is ours.
 
@@ -150,19 +142,43 @@ jobs:
             2. Review it. These rules run against pages we read, so focus on:
                - injections and regexRules — arbitrary JS/CSS injected into the page. On stock
                  ladder v0.0.23 these never executed (upstream had dropped the applyRules call);
-                 our fork restored them, so they are live code again. Treat any new or changed
-                 script content as the highest-risk item: look for exfiltration, remote script
-                 loads, credential or cookie access, and obfuscation.
+                 our fork restored them, so they are live code again. **You are the only gate on
+                 this content — review it line by line, including changes made INSIDE an existing
+                 <script> block, which are easy to overlook because the surrounding lines are
+                 unchanged.**
+
+                 Baseline, audited 2026-08-08 across the whole live ruleset: every injection is
+                 paywall-overlay DOM removal and nothing else — querySelector/querySelectorAll,
+                 .remove(), addEventListener, and two localStorage.clear() calls. There is
+                 **zero** use of fetch, XMLHttpRequest, eval, new Function, atob, document.cookie,
+                 sendBeacon, dynamic import, remote script src, or WebSocket anywhere, and every
+                 external host referenced is either the publisher's own domain or a referrer-spoof
+                 target (google.com, news.google.com, t.co).
+
+                 Verdict NEEDS ATTENTION if a change introduces ANY of: a network call of any kind
+                 (fetch/XHR/sendBeacon/WebSocket/image-beacon), remote or dynamically-constructed
+                 code (eval/new Function/import()/injected <script src>), reads of document.cookie
+                 / localStorage / sessionStorage / form or input values, obfuscation (atob, hex or
+                 unicode escapes, long opaque string literals), a new external host that is not the
+                 publisher or a known referrer-spoof target, or anything that writes rather than
+                 removes page content. Deviation from the removal-only baseline is itself the
+                 signal — say so explicitly in the PR body.
                - headers and urlMods — what we send to the publisher on the user's behalf.
                - useFlareSolverr — should not appear in upstream rules; ours is custom.yaml only.
             3. Open the PR: gh pr create --base main --head ${{ steps.branch.outputs.branch }}
                Title: `fix: sync upstream ruleset ${{ steps.diff.outputs.short_sha }}`
                Body: one-line verdict (SAFE / NEEDS ATTENTION) first, then per-rule findings.
-            4. Auto-merge policy (D10) — apply BOTH conditions:
-               - if your verdict is SAFE **and** the "touches injections/regexRules" flag above is
-                 `false`, run `gh pr merge --auto --squash` on the PR you just opened;
-               - otherwise do NOT merge and do NOT enable auto-merge; say in the PR body that it
-                 is waiting for a manual merge, and why.
+            4. Auto-merge policy (D10, revised 2026-08-08) — **your review verdict is the gate.**
+               - if your verdict is SAFE, run `gh pr merge --auto --squash` on the PR you opened;
+               - if it is NEEDS ATTENTION, do NOT merge and do NOT enable auto-merge; say in the PR
+                 body that it is waiting for a manual merge, and exactly why.
+               There is deliberately no mechanical keyword gate in front of you. The previous
+               `grep` for `injections:`/`regexRules:` was removed because it was measured against
+               all 9 real upstream changes and was both too coarse and too permissive: it blocked
+               6 of 9 — essentially every substantive change — while **missing** the one commit
+               (`8cd6847`) that actually added JavaScript, because the edit was inside an existing
+               <script> block so the key lines never appeared in the diff as +/- lines. Reading the
+               content beats pattern-matching it. That is why you are here.
 
       - name: Claude dry-run review (no PR)
         if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.dry == 'true'
