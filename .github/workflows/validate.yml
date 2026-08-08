@@ -1,0 +1,25 @@
+name: validate
+
+# Upstream's CI concatenates and auto-merges ruleset YAML with zero validation. ladder is
+# fail-soft on a bad source, so a syntax error there silently zeroes the whole ruleset at the
+# next restart rather than failing loudly. This workflow is that missing gate.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pyyaml
+      - run: python scripts/validate-ruleset.py upstream.yaml custom.yaml
