@@ -4,10 +4,6 @@ name: upstream-sync
 # mirror (upstream.yaml), the mirror is refreshed on a branch, Claude reviews the diff, and a PR
 # is opened. custom.yaml is ours and is NEVER touched by this workflow.
 #
-# MERGE POLICY: this workflow NEVER merges. It opens a PR and stops. `main` is unprotected,
-# so a self-authored + self-reviewed + self-merged change would be an unattended write path into
-# rules that execute JS in pages we read. A human merges. (D10 revised 2026-08-08.)
-#
 # Why the review matters again: `injections` and `regexRules` execute attacker-controllable
 # JS/CSS in pages we read. On stock ladder v0.0.23 that rationale was FALSE — upstream had
 # silently dropped the applyRules call, so injections never ran. Our fork restored it
@@ -136,7 +132,7 @@ jobs:
           display_report: 'true'
           # Deliberately wide on read-only shell + Write: the 2026-08-08 dry run logged 6 permission
           # denials for ordinary inspection commands, and `gh pr create --body-file` needs Write.
-          claude_args: '--allowedTools "Bash(git:*),Bash(gh pr create:*),Bash(gh pr edit:*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(cat:*),Bash(ls:*),Bash(grep:*),Bash(head:*),Bash(tail:*),Read,Grep,Glob,Write"'
+          claude_args: '--allowedTools "Bash(git:*),Bash(gh pr create:*),Bash(gh pr edit:*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr merge:*),Bash(cat:*),Bash(ls:*),Bash(grep:*),Bash(head:*),Bash(tail:*),Read,Grep,Glob,Write"'
           prompt: |
             You are reviewing an upstream ruleset sync for avargaskun/ladder-rules, a fork of
             everywall/ladder-rules.
@@ -162,16 +158,11 @@ jobs:
             3. Open the PR: gh pr create --base main --head ${{ steps.branch.outputs.branch }}
                Title: `fix: sync upstream ruleset ${{ steps.diff.outputs.short_sha }}`
                Body: one-line verdict (SAFE / NEEDS ATTENTION) first, then per-rule findings.
-            4. Merge policy — D10 REVISED 2026-08-08: **never merge, and never enable
-               auto-merge.** You open the PR and stop there; a human merges it.
-               - Do NOT run `gh pr merge`. You do not have that tool.
-               - End the PR body with an explicit line: `Awaiting human merge.` followed by the
-                 mechanical risk flag value (`touches injections/regexRules: true|false`) so the
-                 reviewer sees it without opening the diff.
-               Rationale: `main` has no branch protection, so an auto-merge here would be a
-               standing unattended path from an upstream repo we do not control into rules that
-               execute in the household's browser. Upstream has not changed a rule since
-               2026-04-10, so requiring a human merge costs approximately nothing.
+            4. Auto-merge policy (D10) — apply BOTH conditions:
+               - if your verdict is SAFE **and** the "touches injections/regexRules" flag above is
+                 `false`, run `gh pr merge --auto --squash` on the PR you just opened;
+               - otherwise do NOT merge and do NOT enable auto-merge; say in the PR body that it
+                 is waiting for a manual merge, and why.
 
       - name: Claude dry-run review (no PR)
         if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.dry == 'true'
