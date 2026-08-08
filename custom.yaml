@@ -1,0 +1,23 @@
+# custom.yaml — rules we own. The ONLY place `useFlareSolverr: true` ever appears.
+# Upstream rules live in upstream.yaml and are adopted only through reviewed PRs.
+
+# --- ACCEPTANCE CANARY -------------------------------------------------------
+# Do not remove. This rule is the deterministic proof that the fork's restored
+# applyRules pipeline is live (upstream v0.0.23 silently dropped it). Test I5
+# proxies example.com and asserts both markers below are present in the body.
+- domain: example.com
+  injections:
+    - position: head
+      append: |
+        <!-- LADDER-INJECTION-CANARY -->
+  regexRules:
+    - match: "Example Domain"
+      replace: "Example Domain [LADDER-REGEX-CANARY]"
+
+# --- FLARESOLVERR WIRING PROBE ------------------------------------------------
+# nowsecure.nl is FlareSolverr's canonical Cloudflare-challenge test target.
+# Deterministic and publisher-independent. This is the ONLY useFlareSolverr rule.
+- domain: nowsecure.nl
+  useFlareSolverr: true
+  headers:
+    user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36
