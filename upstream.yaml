@@ -1,3 +1,7 @@
+# UPSTREAM RULES — DO NOT EDIT BY HAND.
+# This file mirrors everywall/ladder-rules ruleset.yaml and is adopted only through
+# reviewed pull requests (see README.md). Our own rules live in custom.yaml.
+# synced from everywall/ladder-rules @ 0acc8697d1bbfe2f3b1ce66522d31fe2fe0fc84c on 2026-08-08
 - domain: theathletic.com
   injections:
     - position: head
