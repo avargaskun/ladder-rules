@@ -1,0 +1,185 @@
+name: upstream-sync
+
+# Weekly check for changes in everywall/ladder-rules' ruleset.yaml. When it differs from our
+# mirror (upstream.yaml), the mirror is refreshed on a branch, Claude reviews the diff, and a PR
+# is opened. custom.yaml is ours and is NEVER touched by this workflow.
+#
+# Why the review matters again: `injections` and `regexRules` execute attacker-controllable
+# JS/CSS in pages we read. On stock ladder v0.0.23 that rationale was FALSE — upstream had
+# silently dropped the applyRules call, so injections never ran. Our fork restored it
+# (avargaskun/ladder, "fix: apply ruleset injections and regexRules again"), which is precisely
+# why an unreviewed upstream rule change is now live code again.
+#
+# Note: a PR opened with GITHUB_TOKEN does not trigger this repo's own validate.yml (GitHub's
+# workflow-recursion guard), so the validator runs in this job, before the branch is pushed.
+# That is the real gate; validate.yml re-runs on push to main after the merge.
+
+on:
+  schedule:
+    - cron: '40 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      review_base:
+        description: 'Dry run: review the ruleset diff from this upstream ref to upstream/main and print the verdict. Opens no PR, pushes nothing.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pyyaml
+
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/everywall/ladder-rules.git 2>/dev/null \
+            || git remote set-url upstream https://github.com/everywall/ladder-rules.git
+          git fetch --tags upstream
+
+      - name: Compare upstream ruleset against our mirror
+        id: diff
+        env:
+          REVIEW_BASE: ${{ inputs.review_base }}
+        run: |
+          set -euo pipefail
+          upstream_sha="$(git rev-parse upstream/main)"
+          git show "upstream/main:ruleset.yaml" > /tmp/upstream-ruleset.yaml
+          if [ -n "$REVIEW_BASE" ]; then
+            base="$(git rev-parse "$REVIEW_BASE")"
+            git show "$base:ruleset.yaml" > /tmp/ours-body.yaml
+            dry=true
+          else
+            base="$(sed -n '4s/.*@ \([0-9a-f]\{7,40\}\) .*/\1/p' upstream.yaml)"
+            # Our mirror is upstream's ruleset.yaml verbatim under a 4-line provenance header.
+            tail -n +5 upstream.yaml > /tmp/ours-body.yaml
+            dry=false
+          fi
+          if diff -u /tmp/ours-body.yaml /tmp/upstream-ruleset.yaml > /tmp/ruleset.diff; then
+            changed=false
+          else
+            changed=true
+          fi
+          # Deterministic auto-merge gate (D10): any diff hunk mentioning an executable-content key
+          # disqualifies the PR from auto-merge, regardless of the review verdict.
+          risky=false
+          if grep -Eq '^[+-].*(injections:|regexRules:|<script|javascript:)' /tmp/ruleset.diff; then
+            risky=true
+          fi
+          {
+            echo "upstream_sha=$upstream_sha"
+            echo "short_sha=${upstream_sha:0:7}"
+            echo "base=$base"
+            echo "dry=$dry"
+            echo "changed=$changed"
+            echo "risky=$risky"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### upstream-sync (ladder-rules)"
+            echo ""
+            echo "- upstream/main: \`$upstream_sha\`"
+            echo "- compared against: \`$base\`"
+            echo "- dry run: \`$dry\` · changed: \`$changed\` · touches injections/regexRules: \`$risky\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Refresh the mirror on a branch
+        id: branch
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.dry == 'false'
+        env:
+          SHORT_SHA: ${{ steps.diff.outputs.short_sha }}
+          UPSTREAM_SHA: ${{ steps.diff.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          branch="upstream-sync/rules-$SHORT_SHA"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -b "$branch"
+          # Keep the 3 fixed header lines, regenerate only the provenance line.
+          head -3 upstream.yaml > /tmp/new-upstream.yaml
+          echo "# synced from everywall/ladder-rules @ $UPSTREAM_SHA on $(date -u +%F)" >> /tmp/new-upstream.yaml
+          cat /tmp/upstream-ruleset.yaml >> /tmp/new-upstream.yaml
+          mv /tmp/new-upstream.yaml upstream.yaml
+          # The sync must never touch custom.yaml. Fail closed if anything else moved.
+          if [ "$(git status --porcelain)" != " M upstream.yaml" ]; then
+            echo "REFUSING: the sync changed something other than upstream.yaml:"
+            git status --porcelain
+            exit 1
+          fi
+          python scripts/validate-ruleset.py upstream.yaml custom.yaml
+          git commit -am "fix: sync upstream ruleset $SHORT_SHA"
+          git push origin "$branch"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Claude review + PR
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.dry == 'false'
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          display_report: 'true'
+          claude_args: '--allowedTools "Bash(git:*),Bash(gh pr create:*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr merge:*),Read,Grep,Glob"'
+          prompt: |
+            You are reviewing an upstream ruleset sync for avargaskun/ladder-rules, a fork of
+            everywall/ladder-rules.
+
+            Facts about this run:
+            - upstream/main is ${{ steps.diff.outputs.upstream_sha }}
+            - branch ${{ steps.branch.outputs.branch }} is already committed and pushed; it refreshes
+              upstream.yaml only, and the validator (scripts/validate-ruleset.py) passed on it
+            - the diff touches injections/regexRules (per a deterministic grep):
+              ${{ steps.diff.outputs.risky }}
+
+            Do NOT commit, amend or push anything, and never touch custom.yaml — that file is ours.
+
+            1. Read the change: git diff main..${{ steps.branch.outputs.branch }} -- upstream.yaml
+            2. Review it. These rules run against pages we read, so focus on:
+               - injections and regexRules — arbitrary JS/CSS injected into the page. On stock
+                 ladder v0.0.23 these never executed (upstream had dropped the applyRules call);
+                 our fork restored them, so they are live code again. Treat any new or changed
+                 script content as the highest-risk item: look for exfiltration, remote script
+                 loads, credential or cookie access, and obfuscation.
+               - headers and urlMods — what we send to the publisher on the user's behalf.
+               - useFlareSolverr — should not appear in upstream rules; ours is custom.yaml only.
+            3. Open the PR: gh pr create --base main --head ${{ steps.branch.outputs.branch }}
+               Title: `fix: sync upstream ruleset ${{ steps.diff.outputs.short_sha }}`
+               Body: one-line verdict (SAFE / NEEDS ATTENTION) first, then per-rule findings.
+            4. Auto-merge policy (D10) — apply BOTH conditions:
+               - if your verdict is SAFE **and** the "touches injections/regexRules" flag above is
+                 `false`, run `gh pr merge --auto --squash` on the PR you just opened;
+               - otherwise do NOT merge and do NOT enable auto-merge; say in the PR body that it
+                 is waiting for a manual merge, and why.
+
+      - name: Claude dry-run review (no PR)
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.dry == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          display_report: 'true'
+          claude_args: '--allowedTools "Bash(git:*),Read,Grep,Glob"'
+          prompt: |
+            DRY RUN for avargaskun/ladder-rules' upstream-sync workflow. Open no PR, push nothing,
+            commit nothing, and never touch custom.yaml. Produce the review only.
+
+            Read the ruleset diff with:
+              git diff ${{ steps.diff.outputs.base }}:ruleset.yaml ${{ steps.diff.outputs.upstream_sha }}:ruleset.yaml
+
+            Review it with the same focus the real run uses: injections and regexRules first (they
+            inject arbitrary JS/CSS into pages we read, and our fork restored the applyRules call
+            that upstream v0.0.23 had dropped — so they execute again), then headers, urlMods and
+            any useFlareSolverr.
+
+            Output a one-line verdict (SAFE / NEEDS ATTENTION) followed by the findings.
