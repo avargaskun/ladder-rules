@@ -93,6 +93,8 @@ jobs:
         id: branch
         if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.dry == 'false'
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           SHORT_SHA: ${{ steps.diff.outputs.short_sha }}
           UPSTREAM_SHA: ${{ steps.diff.outputs.upstream_sha }}
         run: |
@@ -100,28 +102,46 @@ jobs:
           branch="upstream-sync/rules-$SHORT_SHA"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git checkout -b "$branch"
-          # Keep the 3 fixed header lines, regenerate only the provenance line.
-          head -3 upstream.yaml > /tmp/new-upstream.yaml
-          echo "# synced from everywall/ladder-rules @ $UPSTREAM_SHA on $(date -u +%F)" >> /tmp/new-upstream.yaml
-          cat /tmp/upstream-ruleset.yaml >> /tmp/new-upstream.yaml
-          mv /tmp/new-upstream.yaml upstream.yaml
-          # The sync must never touch custom.yaml. Fail closed if anything else moved.
-          if [ "$(git status --porcelain)" != " M upstream.yaml" ]; then
-            echo "REFUSING: the sync changed something other than upstream.yaml:"
-            git status --porcelain
-            exit 1
+          # Upstream unchanged since an earlier run: reuse its branch, since a regenerated commit
+          # can never fast-forward onto it.
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            git fetch origin "$branch"
+            git checkout -b "$branch" FETCH_HEAD
+            python scripts/validate-ruleset.py upstream.yaml custom.yaml
+          else
+            git checkout -b "$branch"
+            # Keep the 3 fixed header lines, regenerate only the provenance line.
+            head -3 upstream.yaml > /tmp/new-upstream.yaml
+            echo "# synced from everywall/ladder-rules @ $UPSTREAM_SHA on $(date -u +%F)" >> /tmp/new-upstream.yaml
+            cat /tmp/upstream-ruleset.yaml >> /tmp/new-upstream.yaml
+            mv /tmp/new-upstream.yaml upstream.yaml
+            # The sync must never touch custom.yaml. Fail closed if anything else moved.
+            if [ "$(git status --porcelain)" != " M upstream.yaml" ]; then
+              echo "REFUSING: the sync changed something other than upstream.yaml:"
+              git status --porcelain
+              exit 1
+            fi
+            python scripts/validate-ruleset.py upstream.yaml custom.yaml
+            git commit -am "fix: sync upstream ruleset $SHORT_SHA"
+            git push origin "$branch"
           fi
-          python scripts/validate-ruleset.py upstream.yaml custom.yaml
-          git commit -am "fix: sync upstream ruleset $SHORT_SHA"
-          git push origin "$branch"
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          if [ "$(gh pr list --head "$branch" --state open --json number --jq length)" -gt 0 ]; then
+            pr_open=true
+          else
+            pr_open=false
+          fi
+          {
+            echo "branch=$branch"
+            echo "pr_open=$pr_open"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Claude review + PR
-        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.dry == 'false'
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.dry == 'false' && steps.branch.outputs.pr_open == 'false'
         uses: anthropics/claude-code-action@v1
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # gh prefers a remote named `upstream`, so without this every gh call targets everywall/ladder-rules.
+          GH_REPO: ${{ github.repository }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -137,7 +157,6 @@ jobs:
             - upstream/main is ${{ steps.diff.outputs.upstream_sha }}
             - branch ${{ steps.branch.outputs.branch }} is already committed and pushed; it refreshes
               upstream.yaml only, and the validator (scripts/validate-ruleset.py) passed on it
-            - the diff touches injections/regexRules (per a deterministic grep):
 
             Do NOT commit, amend or push anything, and never touch custom.yaml — that file is ours.
 
@@ -182,6 +201,23 @@ jobs:
                (`8cd6847`) that actually added JavaScript, because the edit was inside an existing
                <script> block so the key lines never appeared in the diff as +/- lines. Reading the
                content beats pattern-matching it. That is why you are here.
+
+      - name: Require the PR
+        if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.dry == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+        run: |
+          set -euo pipefail
+          # The Claude step reports success even when it never opened the PR. Open or already
+          # auto-merged both count.
+          prs="$(gh pr list --head "$BRANCH" --state all --json state,url --jq '[.[] | select(.state != "CLOSED")]')"
+          if [ "$(jq length <<<"$prs")" -eq 0 ]; then
+            echo "::error::no open or merged PR for $BRANCH"
+            exit 1
+          fi
+          jq -r '.[] | "\(.state) \(.url)"' <<<"$prs" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Claude dry-run review (no PR)
         if: steps.diff.outputs.changed == 'true' && steps.diff.outputs.dry == 'true'
